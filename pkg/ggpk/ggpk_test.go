@@ -59,7 +59,7 @@ func TestParseGGPKRecordBody(t *testing.T) {
 	}
 	defer f.Close()
 
-	gf := &GGPKFile{File: f} // Simplified GGPKFile for this test
+	gf := &GGPKFile{reader: f} // Use reader field
 
 	parsedRecord, err := gf.parseGGPKRecordBody(0)
 	if err != nil {
@@ -150,7 +150,7 @@ func TestParseFileRecordBody(t *testing.T) {
 
 			// Simulate GGPKFile context
 			gf := &GGPKFile{
-				File: f,
+				reader: f, // Use reader field
 				Header: GGPKRecord{Version: tc.ggpkVersion}, // Crucial for string decoding
 				utf16LEDecoder: encunicode.UTF16(encunicode.LittleEndian, encunicode.IgnoreBOM).NewDecoder(),
 				utf32LEDecoder: utf32encoding.UTF32(utf32encoding.LittleEndian, utf32encoding.IgnoreBOM).NewDecoder(),
@@ -427,7 +427,7 @@ func TestParseDirectoryRecordBody(t *testing.T) {
 	defer f.Close()
 
 	gf := &GGPKFile{
-		File: f,
+		reader: f, // Use reader field
 		Header: GGPKRecord{Version: 3}, // PC version for UTF-16 names
 		utf16LEDecoder: encunicode.UTF16(encunicode.LittleEndian, encunicode.IgnoreBOM).NewDecoder(),
 		utf32LEDecoder: utf32encoding.UTF32(utf32encoding.LittleEndian, utf32encoding.IgnoreBOM).NewDecoder(),
@@ -497,7 +497,7 @@ func TestReadFileData_UncompressedWithLZ4Prefix(t *testing.T) {
 	f, err := os.Open(filePath); if err != nil {t.Fatal(err)}
 	defer f.Close()
 
-	gf := &GGPKFile{File: f}
+	gf := &GGPKFile{reader: f} // Use reader field
 	fileRec := &FileRecord{
 		Name: "prefixed_uncompressed.txt",
 		DataOffset: 0, // Data starts at beginning of our temp file
@@ -523,7 +523,7 @@ func TestReadFileData_TooShortForLZ4(t *testing.T) {
 	f, err := os.Open(filePath); if err != nil {t.Fatal(err)}
 	defer f.Close()
 
-	gf := &GGPKFile{File: f}
+	gf := &GGPKFile{reader: f} // Use reader field
 	fileRec := &FileRecord{
 		Name: "short.dat",
 		DataOffset: 0,

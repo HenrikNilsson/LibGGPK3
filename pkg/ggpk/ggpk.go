@@ -16,7 +16,8 @@ import (
 
 // GGPKFile represents an opened GGPK file.
 type GGPKFile struct {
-	File            *os.File
+	reader          io.ReadSeeker // Can be *os.File or *bytes.Reader etc.
+	fileSize        int64         // Necessary for readers that don't have an intrinsic size easily available
 	Header          GGPKRecord
 	Root            *DirectoryRecord // Parsed root directory
 	recordCache     map[int64]interface{}
@@ -25,72 +26,102 @@ type GGPKFile struct {
 	utf32LEDecoder  transform.Transformer
 }
 
-// Open opens a GGPK file, reads its header, and returns a GGPKFile struct.
-func Open(filepath string) (*GGPKFile, error) {
-	f, err := os.Open(filepath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open file %s: %w", filepath, err)
-	}
-
+// initGGPKFile initializes common fields for a GGPKFile.
+// It's an internal helper for Open and OpenFromReader.
+func initGGPKFile(rs io.ReadSeeker, size int64) (*GGPKFile, error) {
 	ggpkFile := &GGPKFile{
-		File:           f,
+		reader:         rs,
+		fileSize:       size,
 		recordCache:    make(map[int64]interface{}),
 		stringReadBuf:  make([]byte, 1024), // Initial size, can grow
 		utf16LEDecoder: encunicode.UTF16(encunicode.LittleEndian, encunicode.IgnoreBOM).NewDecoder(),
-		// Try using constants from the utf32 package itself, assuming they are re-exported or defined compatibly.
 		utf32LEDecoder: utf32.UTF32(utf32.LittleEndian, utf32.IgnoreBOM).NewDecoder(),
 	}
 
 	// The GGPKRecord is always at offset 0
 	header, err := ggpkFile.parseGGPKRecordBody(0)
 	if err != nil {
-		f.Close()
+		// If this was from os.Open, we need to close the file.
+		// If it's from OpenFromReader, the caller manages the reader's lifecycle.
+		if f, ok := rs.(*os.File); ok {
+			f.Close()
+		}
 		return nil, fmt.Errorf("failed to parse GGPK header: %w", err)
 	}
 	ggpkFile.Header = *header
 	ggpkFile.recordCache[0] = header
 
-
 	// Basic validation
 	if ggpkFile.Header.Tag != GGPKRecordTag {
-		f.Close()
+		if f, ok := rs.(*os.File); ok {
+			f.Close()
+		}
 		return nil, fmt.Errorf("invalid GGPK file: magic tag not found. Expected %X, got %X", GGPKRecordTag, ggpkFile.Header.Tag)
 	}
 
 	// Parse the root directory
-	// The root directory name is empty.
 	root, err := ggpkFile.ReadDirectoryRecordAt(ggpkFile.Header.RootDirectoryOffset, nil, "")
 	if err != nil {
-		f.Close()
+		if f, ok := rs.(*os.File); ok {
+			f.Close()
+		}
 		return nil, fmt.Errorf("failed to parse root directory: %w", err)
 	}
 	ggpkFile.Root = root
-
-
 	return ggpkFile, nil
 }
 
-// Close closes the underlying file handle.
-func (gf *GGPKFile) Close() error {
-	if gf.File != nil {
-		return gf.File.Close()
+// Open opens a GGPK file from disk, reads its header, and returns a GGPKFile struct.
+func Open(filepath string) (*GGPKFile, error) {
+	f, err := os.Open(filepath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open file %s: %w", filepath, err)
 	}
+
+	fi, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, fmt.Errorf("failed to get file info for %s: %w", filepath, err)
+	}
+
+	return initGGPKFile(f, fi.Size())
+}
+
+// OpenFromReader opens a GGPK file from an io.ReadSeeker (e.g., an in-memory buffer).
+// The fileSize is required to correctly interpret offsets and boundaries.
+func OpenFromReader(rs io.ReadSeeker, fileSize int64) (*GGPKFile, error) {
+	if fileSize <= 0 {
+		return nil, fmt.Errorf("fileSize must be positive for OpenFromReader")
+	}
+	return initGGPKFile(rs, fileSize)
+}
+
+
+// Close closes the underlying file handle if it was opened from a file.
+// If opened from a reader, the caller is responsible for managing the reader's lifecycle.
+func (gf *GGPKFile) Close() error {
+	if f, ok := gf.reader.(*os.File); ok {
+		if f != nil {
+			return f.Close()
+		}
+	}
+	// For other io.ReadSeeker types, we don't close them here.
 	return nil
 }
 
-// readRecordHeader reads the common length and tag from a record at the given offset.
+// readRecordHeaderAndSeek reads the common length and tag from a record at the given offset.
 // It returns the record's total length, its tag, and any error encountered.
 // The file's seek pointer is left at the start of the record's body (after tag).
 func (gf *GGPKFile) readRecordHeaderAndSeek(offset int64) (length int32, tag uint32, err error) {
-	if _, err = gf.File.Seek(offset, io.SeekStart); err != nil {
+	if _, err = gf.reader.Seek(offset, io.SeekStart); err != nil {
 		return 0, 0, fmt.Errorf("seek to offset %d failed: %w", offset, err)
 	}
 
-	if err = binary.Read(gf.File, GGPKEndian, &length); err != nil {
+	if err = binary.Read(gf.reader, GGPKEndian, &length); err != nil {
 		return 0, 0, fmt.Errorf("failed to read record length at offset %d: %w", offset, err)
 	}
 
-	if err = binary.Read(gf.File, GGPKEndian, &tag); err != nil {
+	if err = binary.Read(gf.reader, GGPKEndian, &tag); err != nil {
 		return 0, 0, fmt.Errorf("failed to read record tag at offset %d: %w", offset, err)
 	}
 	return length, tag, nil
@@ -117,13 +148,13 @@ func (gf *GGPKFile) parseGGPKRecordBody(offset int64) (*GGPKRecord, error) {
 	}
 
 	// Read the rest of the GGPKRecord fields
-	if err := binary.Read(gf.File, GGPKEndian, &record.Version); err != nil {
+	if err := binary.Read(gf.reader, GGPKEndian, &record.Version); err != nil {
 		return nil, fmt.Errorf("failed to read GGPKRecord Version: %w", err)
 	}
-	if err := binary.Read(gf.File, GGPKEndian, &record.RootDirectoryOffset); err != nil {
+	if err := binary.Read(gf.reader, GGPKEndian, &record.RootDirectoryOffset); err != nil {
 		return nil, fmt.Errorf("failed to read GGPKRecord RootDirectoryOffset: %w", err)
 	}
-	if err := binary.Read(gf.File, GGPKEndian, &record.FirstFreeOffset); err != nil {
+	if err := binary.Read(gf.reader, GGPKEndian, &record.FirstFreeOffset); err != nil {
 		return nil, fmt.Errorf("failed to read GGPKRecord FirstFreeOffset: %w", err)
 	}
 
@@ -142,7 +173,7 @@ func (gf *GGPKFile) readUTF16String(nameLengthChars uint32) (string, error) {
 		gf.stringReadBuf = gf.stringReadBuf[:numBytes]
 	}
 
-	if _, err := io.ReadFull(gf.File, gf.stringReadBuf); err != nil {
+	if _, err := io.ReadFull(gf.reader, gf.stringReadBuf); err != nil {
 		return "", fmt.Errorf("failed to read UTF-16 string bytes: %w", err)
 	}
 
@@ -177,7 +208,7 @@ func (gf *GGPKFile) readUTF32String(nameLengthChars uint32) (string, error) {
 		gf.stringReadBuf = gf.stringReadBuf[:numBytes]
 	}
 
-	if _, err := io.ReadFull(gf.File, gf.stringReadBuf); err != nil {
+	if _, err := io.ReadFull(gf.reader, gf.stringReadBuf); err != nil { // Use gf.reader
 		return "", fmt.Errorf("failed to read UTF-32 string bytes: %w", err)
 	}
 
@@ -196,10 +227,10 @@ func (gf *GGPKFile) readUTF32String(nameLengthChars uint32) (string, error) {
 func (gf *GGPKFile) parseFileRecordBody(offset int64, baseRecord BaseRecord) (*FileRecord, error) {
 	record := &FileRecord{BaseRecord: baseRecord}
 
-	if err := binary.Read(gf.File, GGPKEndian, &record.NameLength); err != nil {
+	if err := binary.Read(gf.reader, GGPKEndian, &record.NameLength); err != nil { // Use gf.reader
 		return nil, fmt.Errorf("failed to read FileRecord NameLength: %w", err)
 	}
-	if _, err := io.ReadFull(gf.File, record.Hash[:]); err != nil {
+	if _, err := io.ReadFull(gf.reader, record.Hash[:]); err != nil { // Use gf.reader
 		return nil, fmt.Errorf("failed to read FileRecord Hash: %w", err)
 	}
 
@@ -232,7 +263,7 @@ func (gf *GGPKFile) parseFileRecordBody(offset int64, baseRecord BaseRecord) (*F
 	// The file pointer should be at the end of the record after this.
 	// Seek to end of record to ensure next read starts correctly.
 	expectedEndOffset := record.Offset + int64(record.Length)
-	if _, err := gf.File.Seek(expectedEndOffset, io.SeekStart); err != nil {
+	if _, err := gf.reader.Seek(expectedEndOffset, io.SeekStart); err != nil { // Use gf.reader
 		return nil, fmt.Errorf("failed to seek to end of FileRecord at %d: %w", expectedEndOffset, err)
 	}
 
@@ -243,13 +274,13 @@ func (gf *GGPKFile) parseDirectoryRecordBody(offset int64, baseRecord BaseRecord
 	record := &DirectoryRecord{BaseRecord: baseRecord}
 	record.childRecordsDirty = true // Children are not parsed yet
 
-	if err := binary.Read(gf.File, GGPKEndian, &record.NameLength); err != nil {
+	if err := binary.Read(gf.reader, GGPKEndian, &record.NameLength); err != nil { // Use gf.reader
 		return nil, fmt.Errorf("failed to read DirectoryRecord NameLength: %w", err)
 	}
-	if err := binary.Read(gf.File, GGPKEndian, &record.EntryCount); err != nil {
+	if err := binary.Read(gf.reader, GGPKEndian, &record.EntryCount); err != nil { // Use gf.reader
 		return nil, fmt.Errorf("failed to read DirectoryRecord EntryCount: %w", err)
 	}
-	if _, err := io.ReadFull(gf.File, record.Hash[:]); err != nil {
+	if _, err := io.ReadFull(gf.reader, record.Hash[:]); err != nil { // Use gf.reader
 		return nil, fmt.Errorf("failed to read DirectoryRecord Hash: %w", err)
 	}
 
@@ -272,10 +303,10 @@ func (gf *GGPKFile) parseDirectoryRecordBody(offset int64, baseRecord BaseRecord
 
 	record.Entries = make([]DirectoryEntry, record.EntryCount)
 	for i := uint32(0); i < record.EntryCount; i++ {
-		if err := binary.Read(gf.File, GGPKEndian, &record.Entries[i].NameHash); err != nil {
+		if err := binary.Read(gf.reader, GGPKEndian, &record.Entries[i].NameHash); err != nil { // Use gf.reader
 			return nil, fmt.Errorf("failed to read DirectoryEntry NameHash for entry %d: %w", i, err)
 		}
-		if err := binary.Read(gf.File, GGPKEndian, &record.Entries[i].Offset); err != nil {
+		if err := binary.Read(gf.reader, GGPKEndian, &record.Entries[i].Offset); err != nil { // Use gf.reader
 			return nil, fmt.Errorf("failed to read DirectoryEntry Offset for entry %d: %w", i, err)
 		}
 	}
@@ -286,25 +317,28 @@ func (gf *GGPKFile) parseDirectoryRecordBody(offset int64, baseRecord BaseRecord
 
 func (gf *GGPKFile) parseFreeRecordBody(offset int64, baseRecord BaseRecord) (*FreeRecord, error) {
 	record := &FreeRecord{BaseRecord: baseRecord}
-	if err := binary.Read(gf.File, GGPKEndian, &record.NextFreeOffset); err != nil {
+	if err := binary.Read(gf.reader, GGPKEndian, &record.NextFreeOffset); err != nil { // Use gf.reader
 		return nil, fmt.Errorf("failed to read FreeRecord NextFreeOffset: %w", err)
 	}
 	// The rest of the record is free space, seek to the end of it
 	expectedEndOffset := record.Offset + int64(record.Length)
-	if _, currentPos, err := gf.currentOffset(); err != nil {
+	currentPos, err := gf.reader.Seek(0, io.SeekCurrent) // Use gf.reader
+	if err != nil {
 		return nil, fmt.Errorf("failed to get current offset for FreeRecord end seek: %w", err)
-	} else if currentPos != expectedEndOffset { // If not already there (e.g. NextFreeOffset was last field)
-		if _, err := gf.File.Seek(expectedEndOffset, io.SeekStart); err != nil {
+	}
+	if currentPos != expectedEndOffset { // If not already there (e.g. NextFreeOffset was last field)
+		if _, err := gf.reader.Seek(expectedEndOffset, io.SeekStart); err != nil { // Use gf.reader
 			return nil, fmt.Errorf("failed to seek to end of FreeRecord at %d: %w", expectedEndOffset, err)
 		}
 	}
 	return record, nil
 }
 
-func (gf *GGPKFile) currentOffset() (int64, int64, error) {
-	pos, err := gf.File.Seek(0, io.SeekCurrent)
-	return pos, pos, err
-}
+// currentOffset is no longer needed as we directly use gf.reader.Seek(0, io.SeekCurrent)
+// func (gf *GGPKFile) currentOffset() (int64, int64, error) {
+// 	pos, err := gf.reader.Seek(0, io.SeekCurrent)
+// 	return pos, pos, err
+// }
 
 
 // ReadRecordAt attempts to read and identify a record at a given offset.
@@ -339,7 +373,7 @@ func (gf *GGPKFile) ReadRecordAt(offset int64) (interface{}, error) {
 		parsedRecord, err = gf.parseFreeRecordBody(offset, baseRec)
 	default:
 		// Seek to end of unknown record to allow further parsing
-		_, seekErr := gf.File.Seek(offset+int64(length), io.SeekStart)
+		_, seekErr := gf.reader.Seek(offset+int64(length), io.SeekStart) // Use gf.reader
 		if seekErr != nil {
 			return nil, fmt.Errorf("unknown record tag %X at offset %d and failed to seek past it: %w", tag, offset, seekErr)
 		}
@@ -407,10 +441,17 @@ func (dr *DirectoryRecord) GetChildren(gf *GGPKFile) ([]TreeNode, error) {
 	for i, entry := range dr.Entries {
 		// Determine if it's a directory or file by looking at the tag of the record at entry.Offset
 		// This requires reading the header of the child record.
-		_, tag, err := gf.readRecordHeaderAndSeek(entry.Offset)
+		// We need to save and restore current seek position if readRecordHeaderAndSeek changes it
+		// on the shared gf.reader, or ensure readRecordHeaderAndSeek doesn't affect future reads
+		// for this loop if it's only reading headers.
+		// currentOffsetBeforeChildRead, _ := gf.reader.Seek(0, io.SeekCurrent)
+
+		_, tag, err := gf.readRecordHeaderAndSeek(entry.Offset) // This will seek gf.reader
 		if err != nil {
 			return nil, fmt.Errorf("error reading child record header for entry %s (hash %X) at offset %d: %w", dr.Name, entry.NameHash, entry.Offset, err)
 		}
+		// After readRecordHeaderAndSeek, gf.reader is positioned after the child's header.
+		// This is fine as ReadDirectoryRecordAt/ReadFileRecordAt will re-seek.
 
 		var childNode TreeNode
 		switch tag {
@@ -421,7 +462,8 @@ func (dr *DirectoryRecord) GetChildren(gf *GGPKFile) ([]TreeNode, error) {
 		default:
 			// This case should ideally not happen if GGPK is well-formed and entry points to valid FILE/PDIR
 			// Or it could be a FreeRecord, which we might want to handle or log
-			gf.File.Seek(entry.Offset+RecordHeaderSize, io.SeekStart) // Reset seek to after header for next potential read
+			// gf.reader.Seek(entry.Offset+RecordHeaderSize, io.SeekStart) // Reset seek to after header for next potential read
+			// No need to seek back, ReadRecordAt called by ReadDirectoryRecordAt/ReadFileRecordAt will handle seeking.
 			return nil, fmt.Errorf("child entry %s (hash %X) at offset %d has unexpected tag %X", dr.Name, entry.NameHash, entry.Offset, tag)
 		}
 
@@ -449,11 +491,12 @@ func (gf *GGPKFile) ReadFileData(fileRecord *FileRecord) ([]byte, error) {
 	}
 
 	rawData := make([]byte, fileRecord.DataLength)
-	if _, err := gf.File.Seek(fileRecord.DataOffset, io.SeekStart); err != nil {
+	// Seek on the GGPKFile's reader to the data offset
+	if _, err := gf.reader.Seek(fileRecord.DataOffset, io.SeekStart); err != nil { // Use gf.reader
 		return nil, fmt.Errorf("failed to seek to data offset %d for file %s: %w", fileRecord.DataOffset, fileRecord.Name, err)
 	}
 
-	if _, err := io.ReadFull(gf.File, rawData); err != nil {
+	if _, err := io.ReadFull(gf.reader, rawData); err != nil { // Use gf.reader
 		return nil, fmt.Errorf("failed to read raw data for file %s: %w", fileRecord.Name, err)
 	}
 
